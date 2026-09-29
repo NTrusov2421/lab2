@@ -2,9 +2,8 @@
 
 public static class ShapeReader
 {
-    // Читает файл построчно, пропуская некорректные строки
-
-    public static List<Shape> ReadShapes(string path)
+    // Читает файл построчно. Некорректные строки пропускает, отправляя warning в логгер.
+    public static List<Shape> ReadShapes(string path, ErrorLogger logger)
     {
         var shapes = new List<Shape>();
         var lineNo = 0;
@@ -17,7 +16,8 @@ public static class ShapeReader
             {
                 if (!string.IsNullOrWhiteSpace(raw))
                 {
-                    Console.Error.WriteLine($"[warning] строка {lineNo}: некорректное описание, пропущено");
+                    logger.Warn(
+                        $"[warning] строка {lineNo}: некорректное описание, пропущено");
                 }
                 continue;
             }

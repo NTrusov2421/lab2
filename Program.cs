@@ -1,10 +1,15 @@
 ﻿using System.CommandLine;
 using System.Globalization;
+using System.Text.RegularExpressions;
 
 namespace ShapesCli;
 
 public static class Program
 {
+    private static readonly Regex RgbRegex = new(
+        @"^RGB\(\s*(\d{1,3})\s*,\s*(\d{1,3})\s*,\s*(\d{1,3})\s*\)$",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
     public static async Task<int> Main(string[] args)
     {
         // Опции
@@ -33,6 +38,18 @@ public static class Program
                           "Если не задано — список очищается полностью."
         };
 
+        // --log c необязательным значением:
+        //   --log path.txt писать в path.txt и запомнить путь;
+        //   --log писать в последний запомненный путь;
+        //   без --log писать в переменные окружения.
+        var logOption = new Option<string?>("--log")
+        {
+            Description = "Файл для сохранения ошибок. Без значения — в последний " +
+                          "использованный файл. Если --log не указан — в переменные " +
+                          "окружения SHAPESCLI_ERRORS / SHAPESCLI_ERROR_COUNT.",
+            Arity = ArgumentArity.ZeroOrOne
+        };
+
         // Команда
 
         var root = new RootCommand(
@@ -40,6 +57,7 @@ public static class Program
         root.Options.Add(fileOption);
         root.Options.Add(operOption);
         root.Options.Add(propOption);
+        root.Options.Add(logOption);
 
         // Действие
 
@@ -49,55 +67,82 @@ public static class Program
             var oper = parseResult.GetValue(operOption)!;
             var prop = parseResult.GetValue(propOption);
 
+            var logger = new ErrorLogger();
+            var logPath = ResolveLogPath(parseResult, logOption);
+
             if (prop is not null && oper != "del")
             {
-                Console.Error.WriteLine(
+                logger.Warn(
                     "[warning] --prop имеет смысл только с --oper del, игнорируется");
                 prop = null;
             }
 
-            List<Shape> shapes;
+            int exitCode;
             try
             {
-                shapes = ShapeReader.ReadShapes(file.FullName);
-            }
-            catch (FileNotFoundException)
-            {
-                Console.Error.WriteLine($"[error] файл не найден: {file.FullName}");
-                return 1;
+                var shapes = ShapeReader.ReadShapes(file.FullName, logger);
+                exitCode = RunOperation(oper, shapes, prop, logger);
             }
             catch (IOException ex)
             {
-                Console.Error.WriteLine($"[error] не удалось прочитать файл: {ex.Message}");
-                return 1;
+                logger.Error($"[error] не удалось прочитать файл: {ex.Message}");
+                exitCode = 1;
             }
 
-            switch (oper)
-            {
-                case "print":
-                    foreach (var s in shapes)
-                        Console.WriteLine(s);
-                    break;
-
-                case "count":
-                    Console.WriteLine(shapes.Count);
-                    break;
-
-                case "del":
-                    var (ok, removed) = DeleteByProp(shapes, prop);
-                    if (!ok) return 2;
-                    Console.WriteLine($"Удалено: {removed}");
-                    break;
-            }
-
-            return 0;
+            logger.Save(logPath);
+            return exitCode;
         });
 
         var parseResult = root.Parse(args);
         return await parseResult.InvokeAsync();
     }
 
-    private static (bool Ok, int Removed) DeleteByProp(List<Shape> shapes, string? prop)
+    // Определяет, куда сохранять лог
+    private static string? ResolveLogPath(
+        ParseResult parseResult, Option<string?> logOption)
+    {
+        if (parseResult.GetResult(logOption) is null)
+            return null;
+
+        var path = parseResult.GetValue(logOption);
+        if (!string.IsNullOrWhiteSpace(path))
+        {
+            LastLogState.Write(path);
+            return path;
+        }
+
+        return LastLogState.Read();
+    }
+
+    // Операции
+
+    private static int RunOperation(
+        string oper, List<Shape> shapes, string? prop, ErrorLogger logger)
+    {
+        switch (oper)
+        {
+            case "print":
+                foreach (var s in shapes)
+                    Console.WriteLine(s);
+                return 0;
+
+            case "count":
+                Console.WriteLine(shapes.Count);
+                return 0;
+
+            case "del":
+                var (ok, removed) = DeleteByProp(shapes, prop, logger);
+                if (!ok) return 2;
+                Console.WriteLine($"Удалено: {removed}");
+                return 0;
+
+            default:
+                return 0;
+        }
+    }
+
+    private static (bool Ok, int Removed) DeleteByProp(
+        List<Shape> shapes, string? prop, ErrorLogger logger)
     {
         if (prop is null)
         {
@@ -109,8 +154,7 @@ public static class Program
         var parts = prop.Split('=', 2);
         if (parts.Length != 2 || parts[0].Trim().Length == 0)
         {
-            Console.Error.WriteLine(
-                "[error] неверный формат --prop, ожидается key=value");
+            logger.Error("[error] неверный формат --prop, ожидается key=value");
             return (false, 0);
         }
 
@@ -119,14 +163,14 @@ public static class Program
 
         if (!key.Equals("color", StringComparison.OrdinalIgnoreCase))
         {
-            Console.Error.WriteLine($"[warning] неизвестное свойство: {key}");
+            logger.Warn($"[warning] неизвестное свойство: {key}");
             return (true, 0);
         }
 
         if (!TryParseRgb(value, out var target))
         {
-            Console.Error.WriteLine(
-                "[error] значение color должно иметь вид RGB(r,g,b), r,g,b принадлежат [0,255]");
+            logger.Error(
+                "[error] значение color должно иметь вид RGB(r,g,b), r,g,b ∈ [0,255]");
             return (false, 0);
         }
 
@@ -137,19 +181,12 @@ public static class Program
     {
         rgb = RGB.Black;
 
-        if (!value.StartsWith("RGB(", StringComparison.OrdinalIgnoreCase) ||
-            !value.EndsWith(")"))
-        {
-            return false;
-        }
+        var m = RgbRegex.Match(value);
+        if (!m.Success) return false;
 
-        var inner = value[4..^1];
-        var parts = inner.Split(',');
-        if (parts.Length != 3) return false;
-
-        if (!byte.TryParse(parts[0].Trim(), NumberStyles.None, CultureInfo.InvariantCulture, out var r) ||
-            !byte.TryParse(parts[1].Trim(), NumberStyles.None, CultureInfo.InvariantCulture, out var g) ||
-            !byte.TryParse(parts[2].Trim(), NumberStyles.None, CultureInfo.InvariantCulture, out var b))
+        if (!byte.TryParse(m.Groups[1].Value, out var r) ||
+            !byte.TryParse(m.Groups[2].Value, out var g) ||
+            !byte.TryParse(m.Groups[3].Value, out var b))
         {
             return false;
         }

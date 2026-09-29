@@ -12,6 +12,8 @@ public abstract class Shape
     public virtual RGB? Color => null;
 
     public abstract override string ToString();
+    protected static string Fmt(double v) =>
+        v.ToString(System.Globalization.CultureInfo.InvariantCulture);
 }
 
 public sealed class Point : Shape
@@ -27,9 +29,6 @@ public sealed class Point : Shape
 
     public override string ToString() =>
         $"Point({Fmt(X)}, {Fmt(Y)})";
-
-    private static string Fmt(double v) =>
-        v.ToString(System.Globalization.CultureInfo.InvariantCulture);
 }
 
 public class Line : Shape
@@ -63,7 +62,4 @@ public class Circle : Shape
 
     public override string ToString() =>
         $"Circle({Center}, {Fmt(Radius)}, {Color})";
-
-    private static string Fmt(double v) =>
-        v.ToString(System.Globalization.CultureInfo.InvariantCulture);
 }
