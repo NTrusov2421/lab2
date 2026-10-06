@@ -1,5 +1,4 @@
 ﻿using System.CommandLine;
-using System.Globalization;
 using System.Text.RegularExpressions;
 
 namespace ShapesCli;
@@ -10,8 +9,10 @@ public static class Program
         @"^RGB\(\s*(\d{1,3})\s*,\s*(\d{1,3})\s*,\s*(\d{1,3})\s*\)$",
         RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
-    public static async Task<int> Main(string[] args)
+    public static int Main(string[] args)
     {
+        Console.OutputEncoding = System.Text.Encoding.UTF8;
+        Console.InputEncoding = System.Text.Encoding.UTF8;
         // Опции
 
         var fileOption = new Option<FileInfo>("-f", "--file")
@@ -24,18 +25,11 @@ public static class Program
         {
             Required = true,
             Description = "Операция над списком фигур: print | count | del"
-        };
-        operOption.Validators.Add(result =>
-        {
-            var value = result.GetValueOrDefault<string>();
-            if (value is not ("print" or "count" or "del"))
-                result.AddError("Допустимые значения: print, count, del");
-        });
+        }.AcceptOnlyFromAmong("print", "count", "del");
 
         var propOption = new Option<string?>("--prop")
         {
-            Description = "Свойство для --oper del, например: color=RGB(255,127,15). " +
-                          "Если не задано — список очищается полностью."
+            Description = "Свойство для --oper del в формате key=value"
         };
 
         // --log c необязательным значением:
@@ -44,9 +38,7 @@ public static class Program
         //   без --log писать в переменные окружения.
         var logOption = new Option<string?>("--log")
         {
-            Description = "Файл для сохранения ошибок. Без значения — в последний " +
-                          "использованный файл. Если --log не указан — в переменные " +
-                          "окружения SHAPESCLI_ERRORS / SHAPESCLI_ERROR_COUNT.",
+            Description = "Файл лога; без значения используется последний путь",
             Arity = ArgumentArity.ZeroOrOne
         };
 
@@ -61,50 +53,62 @@ public static class Program
 
         // Действие
 
-        root.SetAction(async (parseResult) =>
-        {
-            var file = parseResult.GetValue(fileOption)!;
-            var oper = parseResult.GetValue(operOption)!;
-            var prop = parseResult.GetValue(propOption);
+        root.SetAction(r => Execute(
+            r.GetValue(fileOption)!,
+            r.GetValue(operOption)!,
+            r.GetValue(propOption),
+            GetLogPath(r, logOption)));
 
-            var logger = new ErrorLogger();
-            var logPath = ResolveLogPath(parseResult, logOption);
-
-            if (prop is not null && oper != "del")
-            {
-                logger.Warn(
-                    "[warning] --prop имеет смысл только с --oper del, игнорируется");
-                prop = null;
-            }
-
-            int exitCode;
-            try
-            {
-                var shapes = ShapeReader.ReadShapes(file.FullName, logger);
-                exitCode = RunOperation(oper, shapes, prop, logger);
-            }
-            catch (IOException ex)
-            {
-                logger.Error($"[error] не удалось прочитать файл: {ex.Message}");
-                exitCode = 1;
-            }
-
-            logger.Save(logPath);
-            return exitCode;
-        });
-
-        var parseResult = root.Parse(args);
-        return await parseResult.InvokeAsync();
+        return root.Parse(args).Invoke();
     }
 
-    // Определяет, куда сохранять лог
-    private static string? ResolveLogPath(
-        ParseResult parseResult, Option<string?> logOption)
+    private static int Execute(FileInfo file, string oper, string? prop, string? logPath)
     {
-        if (parseResult.GetResult(logOption) is null)
-            return null;
+        if (prop is not null && oper != "del")
+        {
+            ErrorLogger.Warn("[warning] --prop имеет смысл только с --oper del, игнорируется");
+            prop = null;
+        }
 
-        var path = parseResult.GetValue(logOption);
+        var exitCode = 0;
+        try
+        {
+            var shapes = ShapeReader.ReadShapes(file.FullName);
+
+            switch (oper)
+            {
+                case "print":
+                    foreach (var shape in shapes) Console.WriteLine(shape);
+                    break;
+
+                case "count":
+                    Console.WriteLine(shapes.Count);
+                    break;
+
+                case "del":
+                    var removed = Delete(shapes, prop);
+                    if (removed is null)
+                        exitCode = 2;
+                    else
+                        Console.WriteLine($"Удалено: {removed}");
+                    break;
+            }
+        }
+        catch (IOException ex)
+        {
+            ErrorLogger.Error($"[error] не удалось прочитать файл: {ex.Message}");
+            exitCode = 1;
+        }
+
+        ErrorLogger.Save(logPath);
+        return exitCode;
+    }
+
+    private static string? GetLogPath(ParseResult result, Option<string?> option)
+    {
+        if (result.GetResult(option) is null) return null;
+
+        var path = result.GetValue(option);
         if (!string.IsNullOrWhiteSpace(path))
         {
             LastLogState.Write(path);
@@ -114,82 +118,48 @@ public static class Program
         return LastLogState.Read();
     }
 
-    // Операции
-
-    private static int RunOperation(
-        string oper, List<Shape> shapes, string? prop, ErrorLogger logger)
-    {
-        switch (oper)
-        {
-            case "print":
-                foreach (var s in shapes)
-                    Console.WriteLine(s);
-                return 0;
-
-            case "count":
-                Console.WriteLine(shapes.Count);
-                return 0;
-
-            case "del":
-                var (ok, removed) = DeleteByProp(shapes, prop, logger);
-                if (!ok) return 2;
-                Console.WriteLine($"Удалено: {removed}");
-                return 0;
-
-            default:
-                return 0;
-        }
-    }
-
-    private static (bool Ok, int Removed) DeleteByProp(
-        List<Shape> shapes, string? prop, ErrorLogger logger)
+    private static int? Delete(List<Shape> shapes, string? prop)
     {
         if (prop is null)
         {
-            var n = shapes.Count;
+            var removed = shapes.Count;
             shapes.Clear();
-            return (true, n);
+            return removed;
         }
 
         var parts = prop.Split('=', 2);
-        if (parts.Length != 2 || parts[0].Trim().Length == 0)
+        if (parts.Length != 2 || string.IsNullOrWhiteSpace(parts[0]))
         {
-            logger.Error("[error] неверный формат --prop, ожидается key=value");
-            return (false, 0);
+            ErrorLogger.Error("[error] неверный формат --prop, ожидается key=value");
+            return null;
         }
 
         var key = parts[0].Trim();
         var value = parts[1].Trim();
-
         if (!key.Equals("color", StringComparison.OrdinalIgnoreCase))
         {
-            logger.Warn($"[warning] неизвестное свойство: {key}");
-            return (true, 0);
+            ErrorLogger.Warn($"[warning] неизвестное свойство: {key}");
+            return 0;
         }
 
         if (!TryParseRgb(value, out var target))
         {
-            logger.Error(
-                "[error] значение color должно иметь вид RGB(r,g,b), r,g,b ∈ [0,255]");
-            return (false, 0);
+            ErrorLogger.Error("[error] значение color должно иметь вид RGB(r,g,b), r,g,b = [0,255]");
+            return null;
         }
 
-        return (true, shapes.RemoveAll(s => target.Equals(s.Color)));
+        return shapes.RemoveAll(s => s.Color == target);
     }
 
     private static bool TryParseRgb(string value, out RGB rgb)
     {
         rgb = RGB.Black;
-
         var m = RgbRegex.Match(value);
-        if (!m.Success) return false;
-
-        if (!byte.TryParse(m.Groups[1].Value, out var r) ||
+        if (!m.Success ||
+            !byte.TryParse(m.Groups[1].Value, out var r) ||
             !byte.TryParse(m.Groups[2].Value, out var g) ||
             !byte.TryParse(m.Groups[3].Value, out var b))
-        {
             return false;
-        }
 
         rgb = new RGB(r, g, b);
         return true;

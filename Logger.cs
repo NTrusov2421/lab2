@@ -1,32 +1,34 @@
-﻿using System.Globalization;
+﻿using System.ComponentModel;
+using System.Globalization;
 
 namespace ShapesCli;
 
-// Собирает все сообщения и в конце работы сохраняет их:
-// - в файл, если Save(path) получил путь;
-// - в переменные окружения SHAPESCLI_ERRORS / SHAPESCLI_ERROR_COUNT, если path == null.
-public sealed class ErrorLogger
+public static class ErrorLogger
 {
-    private readonly List<string> _messages = new();
+    private static readonly string DefaultLogFile = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+        "ShapesCli",
+        "errors.log");
 
-    public void Warn(string message) => Add(message);
-    public void Error(string message) => Add(message);
+    private static readonly List<string> Messages = new();
 
-    private void Add(string message)
+    public static void Warn(string message) => Add(message);
+    public static void Error(string message) => Add(message);
+
+    private static void Add(string message)
     {
         Console.Error.WriteLine(message);
-        _messages.Add(message);
+        Messages.Add(message);
+        AppendLine(DefaultLogFile, message);
     }
 
-    public void Save(string? path)
+    public static void Save(string? path)
     {
-        if (path is null)
-            SaveToEnv();
-        else
+        if (path is not null)
             SaveToFile(path);
     }
 
-    private void SaveToFile(string path)
+    private static void SaveToFile(string path)
     {
         try
         {
@@ -34,28 +36,43 @@ public sealed class ErrorLogger
             if (!string.IsNullOrEmpty(dir))
                 Directory.CreateDirectory(dir);
 
-            File.WriteAllLines(path, _messages);
+            File.WriteAllLines(path, Messages);
         }
         catch (Exception ex)
         {
             Console.Error.WriteLine(
-                $"[error] не удалось записать лог в {path}: {ex.Message}");
+                $"[error] не удалось записать лог в {path}: {Describe(ex)}");
         }
     }
 
-    private void SaveToEnv()
+    private static void AppendLine(string path, string message)
     {
-        Environment.SetEnvironmentVariable(
-            "SHAPESCLI_ERRORS",
-            string.Join(Environment.NewLine, _messages));
-        Environment.SetEnvironmentVariable(
-            "SHAPESCLI_ERROR_COUNT",
-            _messages.Count.ToString(CultureInfo.InvariantCulture));
+        try
+        {
+            var dir = Path.GetDirectoryName(path);
+            if (!string.IsNullOrEmpty(dir))
+                Directory.CreateDirectory(dir);
+
+            File.AppendAllText(path, message + Environment.NewLine);
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine(
+                $"[error] не удалось записать лог в {path}: {Describe(ex)}");
+        }
+    }
+
+    private static string Describe(Exception ex)
+    {
+        var win32 = new Win32Exception(ex.HResult);
+
+        if (win32.NativeErrorCode == 0 || win32.Message == ex.Message)
+            return ex.Message;
+
+        return $"{ex.Message} (errno {win32.NativeErrorCode}: {win32.Message})";
     }
 }
 
-// Хранит путь к последнему использованному файлу лога.
-// Один текстовый файл в каталоге ApplicationData.
 public static class LastLogState
 {
     private static string StateFile => Path.Combine(
